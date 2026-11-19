@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musicorganizer"
+version = "0.1.0"
+description = "Personal local music library organizer"
+requires-python = ">=3.11"
+dependencies = ["mutagen>=1.47"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+providers = ["ytmusicapi>=1.8"]
+
+[tool.setuptools.packages.find]
+include = ["musicorganizer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

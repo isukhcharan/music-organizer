@@ -1,0 +1,27 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Local data: reports and DBs contain the user's personal library paths/metadata
+data/
+reports/
+Output/
+output/
+*.db
+*.sqlite3
+
+# Secrets / local config
+.env
+*.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.egg-info/
