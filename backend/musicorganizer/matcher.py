@@ -87,7 +87,7 @@ def new_row(path: Path, local: dict, candidates: list[dict], method: str = "") -
         "local_albumartist": local["albumartist"], "local_album": local["album"],
         "folder_album_hint": local["folder_album_hint"], "status": "REVIEW",
         "score": 0, "matched_title": "", "matched_artist": "", "matched_album": "",
-        "matched_albumartist": "", "matched_year": "", "provider_id": "", "provider_url": "",
+        "matched_albumartist": "", "matched_year": "", "matched_genre": "", "provider_id": "", "provider_url": "",
         "track_number": "", "release_track_match": "", "duplicate_of": "", "output": "",
         "detail_status": "", "candidates": json.dumps(candidates[:8], ensure_ascii=False),
     }
@@ -173,7 +173,7 @@ def resolve_song_candidate(provider: Provider, candidate: dict, local: dict) -> 
     error = "" if verified else (YT_UNVERIFIED if ytmusic else "Tracklist verification unavailable")
     return {"album": detail.get("album") or candidate.get("album_hint", ""),
             "album_artist": detail.get("album_artist", ""), "year": detail.get("year", "") or candidate.get("year", ""),
-            "tracks": tracks, "verified": verified}, error
+            "genre": detail.get("genre", ""), "tracks": tracks, "verified": verified}, error
 
 
 def identify_single(path: Path, local: dict, provider: Provider, duplicates: DuplicateTracker) -> dict:
@@ -252,7 +252,8 @@ def identify_single(path: Path, local: dict, provider: Provider, duplicates: Dup
 
     row.update({"score": cand["score"], "matched_title": cand["title"], "matched_artist": cand["artist"],
                 "matched_album": chosen["album"], "matched_albumartist": chosen["album_artist"],
-                "matched_year": chosen["year"], "provider_id": cand["id"], "provider_url": cand["url"]})
+                "matched_year": chosen["year"], "matched_genre": chosen.get("genre", ""),
+                "provider_id": cand["id"], "provider_url": cand["url"]})
     verified = chosen.get("verified")
     if not verified:
         row["detail_status"] = chosen["error"] or "Could not uniquely verify title in release tracklist"
@@ -370,6 +371,7 @@ def identify_album_group(paths: list[Path], locals_by_path: dict, provider: Prov
         row.update({"score": round(chosen[0], 4), "matched_album": detail["album"],
                     "matched_albumartist": detail.get("album_artist", ""),
                     "matched_artist": detail.get("provider_artist", ""), "matched_year": detail.get("year", ""),
+                    "matched_genre": detail.get("genre", ""),
                     "provider_id": cand.get("id", ""), "provider_url": cand.get("url", "")})
         if not match:
             row["detail_status"] = "Album identified, but this local track did not uniquely match a track on its tracklist"

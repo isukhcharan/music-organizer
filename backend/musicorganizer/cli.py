@@ -35,19 +35,34 @@ from .tags import read_local
 DEFAULT_DB = Path.home() / ".musicorganizer" / "state.db"
 
 
-def build_provider(name: str = "auto"):
-    """``auto`` = YouTube Music first with JioSaavn as the fallback (JioSaavn skipped if musicapy is missing)."""
-    from .providers import ChainProvider, SaavnProvider, YTMusicProvider
+PROVIDER_ORDER = ["ytmusic", "jiosaavn", "itunes"]      # priority: earlier sources win, later ones only fill gaps
 
-    if name == "ytmusic":
-        return ChainProvider([YTMusicProvider()])
-    if name == "jiosaavn":
-        return ChainProvider([SaavnProvider()])
-    providers = [YTMusicProvider()]
-    try:
-        providers.append(SaavnProvider())
-    except Exception:  # musicapy not installed: YouTube Music only
-        pass
+
+def parse_providers(spec: str) -> list[str]:
+    """'auto' or a comma list like 'ytmusic,itunes' -> provider names in priority order. Raises ValueError."""
+    spec = (spec or "auto").strip().lower()
+    if spec == "auto":
+        return list(PROVIDER_ORDER)
+    names = [s.strip() for s in spec.split(",") if s.strip()]
+    unknown = [n for n in names if n not in PROVIDER_ORDER]
+    if unknown or not names:
+        raise ValueError(f"unknown metadata source {unknown or spec!r}; choose from {', '.join(PROVIDER_ORDER)} or 'auto'")
+    return [n for n in PROVIDER_ORDER if n in names]
+
+
+def build_provider(spec: str = "auto"):
+    """Chain of the chosen sources. ``auto`` = YouTube Music, then JioSaavn, then iTunes (missing packages skipped)."""
+    from .providers import ChainProvider, ITunesProvider, SaavnProvider, YTMusicProvider
+
+    makers = {"ytmusic": YTMusicProvider, "jiosaavn": SaavnProvider, "itunes": ITunesProvider}
+    names = parse_providers(spec)
+    providers = []
+    for n in names:
+        try:
+            providers.append(makers[n]())
+        except Exception:
+            if spec.strip().lower() != "auto":
+                raise            # an explicitly chosen source must work; only "auto" skips unavailable ones
     return ChainProvider(providers)
 
 
@@ -108,12 +123,13 @@ def cmd_apply(args, store: Store, journal: Journal) -> int:
     if not args.yes:
         print("Refusing to move files without --yes. Run `plan` first, then add --yes.")
         return 2
+    mode = "copy" if getattr(args, "copy", False) else "move"
     rows = store.load_rows(args.job)
     plan = plan_moves(rows, Path(job["output_dir"]))
-    apply_plan(plan, journal, job_id=args.job)
+    apply_plan(plan, journal, job_id=args.job, mode=mode)
     store.save_rows(args.job, rows)
     store.set_state(args.job, "applied")
-    done = Counter(o["status"] for o in journal.operations(args.job) if o["op_type"] == "move")
+    done = Counter(o["status"] for o in journal.operations(args.job) if o["op_type"] == mode)
     print(f"Done: {dict(done)}. Undo with: python -m musicorganizer undo --job {args.job}")
     return 0 if not done.get("failed") else 1
 
@@ -207,8 +223,8 @@ def cmd_apply_reviewed(args, store: Store, journal: Journal) -> int:
         if not decision or decision["applied"]:
             continue
         plan = plan_manual(row, decision["candidate"], out_root, decision["choices"])
-        apply_plan(plan, journal, job_id=args.job)
-        ok = row.get("status") == "MOVED"
+        apply_plan(plan, journal, job_id=args.job, mode="copy" if getattr(args, "copy", False) else "move")
+        ok = row.get("status") in ("MOVED", "COPIED")
         if ok:
             row["manual_resolution"] = "applied"
             store.mark_applied(args.job, row["source"])
@@ -216,7 +232,7 @@ def cmd_apply_reviewed(args, store: Store, journal: Journal) -> int:
         else:
             failed += 1
         store.save_rows(args.job, [row])
-        print(f"{'MOVED ' if ok else 'FAILED'} {Path(row['source']).name} -> {row.get('output', '')}")
+        print(f"{row.get('status') if ok else 'FAILED'} {Path(row['source']).name} -> {row.get('output', '')}")
     print(f"\nManually resolved: {moved} moved, {failed} failed.")
     return 0 if not failed else 1
 
@@ -243,6 +259,9 @@ def cmd_repair(args, store: Store, journal: Journal) -> int:
     filled = Counter(c.genre_source for c in changes if c.new_genre)
     print(f"{len(changes)} files would change: {junk_c} junk comments removed, {cleared} junk genres cleared, "
           f"genre filled {dict(filled)}.")
+    fills = Counter(k for c in changes for k in c.fills)
+    print(f"Blank tags that would be filled from folder/filename: album artist {fills['TPE2']}, "
+          f"track number {fills['TRCK']}, year {fills['TDRC']}.")
     print(f"{len(overrides)} existing genres would be OVERRIDDEN by a more specific per-track genre:")
     for c in overrides[:12]:
         print(f"    {c.path.name[:50]:<50} {' / '.join(c.replaced)} -> {' / '.join(c.new_genre)}")
@@ -263,6 +282,41 @@ def cmd_repair(args, store: Store, journal: Journal) -> int:
     done = Counter(o["status"] for o in journal.operations(job))
     print(f"Done: {dict(done)}. Undo with: python -m musicorganizer undo --job {job}")
     return 0 if not done.get("failed") else 1
+
+
+def cmd_serve(args, store: Store, journal: Journal) -> int:
+    from .api import serve
+
+    print(f"Music Organizer UI: http://127.0.0.1:{args.port}  (local only; Ctrl+C to stop)")
+    serve(args.db, args.port, open_browser=not args.no_browser)
+    return 0
+
+
+def cmd_cleanup(args, store: Store, journal: Journal) -> int:
+    """Remove empty / leftover-only folders from the INPUT folder. Preview unless --yes."""
+    from .cleanup import apply_cleanup, default_trash, plan_cleanup
+
+    job = _job(store, args.job)
+    if not job:
+        return 2
+    dirs = plan_cleanup(Path(job["input_dir"]))
+    if not dirs:
+        print("Nothing to clean up: no empty or leftover-only folders in the input folder.")
+        return 0
+    for d in dirs:
+        extra = f" ({', '.join(d.files[:6])}{'…' if len(d.files) > 6 else ''})" if d.files else ""
+        tick = "[x]" if d.default_selected else "[ ]"
+        print(f"{tick} {d.kind:<9} {d.path}{extra}{'  <- has images, not removed by default' if d.has_images else ''}")
+    chosen = [str(d.path) for d in dirs if d.default_selected or args.include_images]
+    if not args.yes:
+        print(f"\nPreview only. {len(chosen)} folder(s) would be removed "
+              f"(empty ones deleted, leftovers sent to the Recycle Bin). Re-run with --yes.")
+        return 0
+    result = apply_cleanup(Path(job["input_dir"]), chosen, journal, args.job, default_trash())
+    print(f"Removed {result['removed_empty']} empty folder(s), sent {result['trashed']} to the Recycle Bin.")
+    for s in result["skipped"]:
+        print(f"  skipped {s['path']}: {s['reason']}")
+    return 0
 
 
 def cmd_undo(args, store: Store, journal: Journal) -> int:
@@ -298,15 +352,16 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("scan", help="identify tracks (moves nothing)")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--provider", choices=["auto", "ytmusic", "jiosaavn"], default="auto",
-                   help="auto = YouTube Music first, JioSaavn as fallback")
+    p.add_argument("--provider", default="auto",
+                   help="auto (YouTube Music, then JioSaavn, then iTunes) or a comma list, e.g. ytmusic,itunes")
     p.set_defaults(fn=cmd_scan)
     for name, fn, help_ in (("plan", cmd_plan, "preview moves"), ("apply", cmd_apply, "move approved tracks"),
                             ("undo", cmd_undo, "restore moved files"), ("report", cmd_report, "export CSV")):
         p = sub.add_parser(name, help=help_)
         p.add_argument("--job", required=True)
         if name == "apply":
-            p.add_argument("--yes", action="store_true", help="confirm that files should be moved")
+            p.add_argument("--yes", action="store_true", help="confirm that files should be moved or copied")
+            p.add_argument("--copy", action="store_true", help="copy instead of move: the originals stay untouched")
         if name == "report":
             p.add_argument("--csv", required=True)
         p.set_defaults(fn=fn)
@@ -316,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("apply-reviewed", help="move tracks according to saved review decisions")
     p.add_argument("--job", required=True)
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--copy", action="store_true", help="copy instead of move: the originals stay untouched")
     p.set_defaults(fn=cmd_apply_reviewed)
     p = sub.add_parser("repair", help="fix junk comments/genres in place (preview unless --yes)")
     p.add_argument("--input", required=True)
@@ -325,6 +381,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="also fill blank genres with the artist's usual genre (less accurate per track)")
     p.add_argument("--csv", help="write the per-file preview here")
     p.set_defaults(fn=cmd_repair)
+    p = sub.add_parser("cleanup", help="remove empty/leftover-only folders from the input folder (preview unless --yes)")
+    p.add_argument("--job", required=True)
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--include-images", action="store_true", help="also remove folders that hold cover images")
+    p.set_defaults(fn=cmd_cleanup)
+    p = sub.add_parser("serve", help="start the local web UI (binds to 127.0.0.1 only)")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-browser", action="store_true")
+    p.set_defaults(fn=cmd_serve)
     sub.add_parser("jobs", help="list jobs").set_defaults(fn=cmd_jobs)
     args = parser.parse_args(argv)
     store, journal = Store(args.db), Journal(args.db)

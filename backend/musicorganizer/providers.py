@@ -284,3 +284,96 @@ class SaavnProvider:
                     or candidate.get("year", ""),
             "tracks": self._tracklist(album),
         }
+
+
+class ITunesProvider:
+    """Apple iTunes Search API (free, no key). Gives real track numbers, release year and a genre.
+
+    Rate limited by Apple (~20 requests/minute), so requests are spaced out and one retry is made after a
+    429/403. ``fetch(url) -> dict`` is injectable for tests.
+    """
+
+    name = "itunes"
+    BASE = "https://itunes.apple.com"
+
+    def __init__(self, fetch=None, min_interval: float = 1.5, country: str = "US"):
+        self._fetch = fetch or self._http
+        self.min_interval = min_interval
+        self.country = country
+        self._last = 0.0
+
+    def _http(self, url: str) -> dict:
+        import json
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"User-Agent": "music-organizer/0.1"})
+        for attempt in (1, 2):
+            wait = self.min_interval - (time.time() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.time()
+            try:
+                return json.load(urllib.request.urlopen(req, timeout=20))
+            except urllib.error.HTTPError as exc:
+                if exc.code in (403, 429) and attempt == 1:
+                    time.sleep(30)          # rate limited: back off once, then try again
+                    continue
+                raise
+        return {}
+
+    def _get(self, path: str, **params) -> list[dict]:
+        from urllib.parse import urlencode
+
+        url = f"{self.BASE}/{path}?" + urlencode({**params, "country": self.country})
+        return list(self._fetch(url).get("results", []))
+
+    @staticmethod
+    def _year(date: str) -> str:
+        return (date or "")[:4]
+
+    @staticmethod
+    def _album(name: str) -> str:
+        """iTunes names singles 'Title - Single' and EPs 'Title - EP'; that suffix is not part of the album title."""
+        import re
+
+        return re.sub(r"\s+-\s+(single|ep)\s*$", "", name or "", flags=re.I).strip()
+
+    def search_songs(self, query):
+        out = []
+        for r in self._get("search", term=query, entity="song", limit=10):
+            if r.get("kind") != "song":
+                continue
+            out.append({"source": self.name, "title": r.get("trackName", ""), "artist": r.get("artistName", ""),
+                        "id": str(r.get("trackId", "")), "url": r.get("trackViewUrl", ""),
+                        "year": self._year(r.get("releaseDate", "")), "album_hint": self._album(r.get("collectionName", "")),
+                        "browse_id": str(r.get("collectionId", "") or "")})
+        return out
+
+    def search_albums(self, query):
+        out = []
+        for r in self._get("search", term=query, entity="album", limit=10):
+            if r.get("collectionType") not in (None, "Album") or not r.get("collectionName"):
+                continue
+            cid = str(r.get("collectionId", ""))
+            out.append({"source": self.name, "title": self._album(r["collectionName"]), "artist": r.get("artistName", ""),
+                        "id": cid, "url": r.get("collectionViewUrl", ""), "browse_id": cid})
+        return out
+
+    def album_details(self, ref):
+        cid = ref.get("browse_id") or ref.get("id")
+        if not cid:
+            return None
+        rows = self._get("lookup", id=cid, entity="song")
+        album = next((r for r in rows if r.get("wrapperType") == "collection"), None)
+        if not album:
+            return None
+        tracks = [{"song": t.get("trackName", ""), "primary_artists": t.get("artistName", ""),
+                   "sequence": str(t.get("trackNumber") or "")}
+                  for t in rows if t.get("wrapperType") == "track" and t.get("kind") == "song"]
+        return {"album": self._album(album.get("collectionName", "")), "album_artist": "",
+                "provider_artist": album.get("artistName", ""), "year": self._year(album.get("releaseDate", "")),
+                "genre": album.get("primaryGenreName", ""), "tracks": tracks}
+
+    def album_for_song(self, candidate):
+        return self.album_details(candidate) if candidate.get("browse_id") else None

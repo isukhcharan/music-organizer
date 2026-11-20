@@ -90,7 +90,7 @@ def plan_manual(row: dict, candidate: dict, out_root: Path,
     dest, collided = _unique_dest(folder, stem + source.suffix.lower(), set())
     op = PlannedOp(row, source, dest, {k: v for k, v in values.items() if v}, overwrite=True, collision=collided)
     for sc in _sidecars(source):
-        target, _ = _unique_dest(folder, sc.name, {dest})
+        target, _ = _unique_dest(folder, dest.stem + sc.suffix, {dest})
         op.sidecars.append((sc, target))
     return Plan([op], [])
 

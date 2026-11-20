@@ -20,7 +20,8 @@ from pathlib import Path
 from mutagen import File as MutagenFile
 
 from .journal import Journal
-from .repair import undo_retag
+from .genres import genre_is_invalid, map_itunes_genre
+from .repair import restore_junk_frames, strip_junk_frames, undo_retag
 from .layout import destination_dir, destination_filename, infer_album_artists
 from .tags import AUDIO_EXTS, fill_blank_tags, read_local, restore_tags, snapshot_tags, write_tags
 from .text import primary_artist
@@ -104,11 +105,14 @@ def plan_moves(rows: list[dict], out_root: Path) -> Plan:
             "album": local["album"] or row.get("matched_album") or album_name,
             "date": local["date"] or row.get("matched_year"),
             "tracknumber": local["tracknumber"] or (str(track) if track else ""),
-            "genre": local["genre"],
+            # a junk local genre ("latest", "djpunjab", ...) counts as blank; a provider genre may then fill it
+            "genre": ("" if genre_is_invalid([local["genre"]]) else local["genre"])
+                     or map_itunes_genre(row.get("matched_genre", "")) or "",
         }
         op = PlannedOp(row, source, dest, values, collision=collided)
         for sc in _sidecars(source):
-            target, _ = _unique_dest(folder, sc.name, reserved)
+            # keep the sidecar paired with its song: it follows the song's new file name
+            target, _ = _unique_dest(folder, dest.stem + sc.suffix, reserved)
             reserved.add(target)
             op.sidecars.append((sc, target))
         ops.append(op)
@@ -128,11 +132,23 @@ def _verify(copy: Path, expected_length: float) -> None:
         raise OSError("audio duration changed while writing tags")
 
 
-def apply_plan(plan: Plan, journal: Journal, job_id: str | None = None) -> str:
-    """Execute the plan. Returns the job id. Never raises for a single file's failure."""
+def _signature(path: Path) -> list[int]:
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
+def apply_plan(plan: Plan, journal: Journal, job_id: str | None = None, mode: str = "move") -> str:
+    """Execute the plan. Returns the job id. Never raises for a single file's failure.
+
+    ``mode="move"`` removes each source after its tagged copy is verified. ``mode="copy"`` never touches the
+    source at all: the library you started from is preserved exactly as it was.
+    """
+    if mode not in ("move", "copy"):
+        raise ValueError("mode must be 'move' or 'copy'")
+    copying = mode == "copy"
     job_id = job_id or journal.new_job_id()
     for op in plan.movable:
-        op_id = journal.begin(job_id, "move", op.source, op.dest)
+        op_id = journal.begin(job_id, mode, op.source, op.dest)
         tmp = op.dest.with_name(f".mo-tmp-{op.dest.name}")
         try:
             if not op.source.exists():
@@ -143,27 +159,37 @@ def apply_plan(plan: Plan, journal: Journal, job_id: str | None = None) -> str:
             expected_length = _length(op.source)
             before = snapshot_tags(op.source, op.tag_values)   # source is only read, never written
             shutil.copy2(op.source, tmp)
+            junk = strip_junk_frames(tmp)     # junk comments / genre never reach the library
             writer = write_tags if op.overwrite else fill_blank_tags
             written = writer(tmp, op.tag_values)
             _verify(tmp, expected_length)
             os.replace(tmp, op.dest)
-            op.source.unlink()
+            if not copying:
+                op.source.unlink()
         except Exception as exc:
             if tmp.exists():
                 tmp.unlink()
             journal.finish(op_id, "failed", f"{type(exc).__name__}: {exc}")
             op.row["status"] = "APPLY_ERROR"
-            op.row["detail_status"] = f"{op.row.get('detail_status', '')}; move failed: {type(exc).__name__}: {exc}"
+            op.row["detail_status"] = f"{op.row.get('detail_status', '')}; {mode} failed: {type(exc).__name__}: {exc}"
             continue
-        journal.finish(op_id, "done", fields_written=written,
-                       tags_before={f: before.get(f, []) for f in written})
+        saved = {f: before.get(f, []) for f in written}
+        if junk and not copying:
+            saved["_junk"] = junk                  # a copy's source is untouched, so there is nothing to restore
+        if copying:
+            saved = {"_sig": _signature(op.dest)}  # lets undo prove the copy is still exactly what we made
+        journal.finish(op_id, "done", fields_written=written, tags_before=saved)
         op.row["output"] = str(op.dest)
-        op.row["status"] = "MOVED"
+        op.row["status"] = "COPIED" if copying else "MOVED"
         for sc_src, sc_dest in op.sidecars:
-            sid = journal.begin(job_id, "sidecar", sc_src, sc_dest)
+            sid = journal.begin(job_id, "copy_sidecar" if copying else "sidecar", sc_src, sc_dest)
             try:
                 if sc_dest.exists():
                     raise FileExistsError(str(sc_dest))
+                if copying:
+                    shutil.copy2(sc_src, sc_dest)
+                    journal.finish(sid, "done", tags_before={"_sig": _signature(sc_dest)})
+                    continue
                 shutil.move(str(sc_src), str(sc_dest))
                 journal.finish(sid, "done")
             except Exception as exc:
@@ -195,6 +221,27 @@ def undo_job(journal: Journal, job_id: str, stop_at: Path | None = None) -> dict
     for op in reversed(journal.operations(job_id)):
         if op["status"] != "done":
             continue
+        if op["op_type"] == "cleanup":    # removed empty folders are not recreated; leftovers are in the Recycle Bin
+            continue
+        if op["op_type"] in ("copy", "copy_sidecar"):   # undo a copy: delete only our own, unmodified copy
+            dest = Path(op["dest"])
+            sig = json.loads(op["tags_before"] or "{}").get("_sig")
+            if not dest.exists():
+                reason = "the copy no longer exists"
+            elif sig and _signature(dest) != sig:
+                reason = "the copy was modified after it was made, so it was left alone"
+            else:
+                try:
+                    dest.unlink()
+                    _prune_empty_dirs(dest.parent, Path(stop_at) if stop_at else None)
+                    journal.finish(op["id"], "undone")
+                    result["undone"] += 1
+                    continue
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+            journal.finish(op["id"], "undo_skipped", reason)
+            result["skipped"].append((str(dest), reason))
+            continue
         if op["op_type"] == "retag":      # in-place tag repair: restore the removed/replaced frames
             try:
                 undo_retag(Path(op["source"]), json.loads(op["tags_before"] or "{}"))
@@ -215,9 +262,13 @@ def undo_job(journal: Journal, job_id: str, stop_at: Path | None = None) -> dict
                 shutil.move(str(dest), str(src))
                 _prune_empty_dirs(dest.parent, Path(stop_at) if stop_at else None)
                 before = json.loads(op["tags_before"] or "{}")
-                if before:
+                junk = before.pop("_junk", None)
+                if before or junk:
                     try:
-                        restore_tags(src, before)
+                        if before:
+                            restore_tags(src, before)
+                        if junk:
+                            restore_junk_frames(src, junk)
                     except Exception as exc:  # file is back; only its tags could not be reverted
                         result.setdefault("warnings", []).append((str(src), f"tags not restored: {exc}"))
                 journal.finish(op["id"], "undone")

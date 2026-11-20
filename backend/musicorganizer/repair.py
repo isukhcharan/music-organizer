@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import urllib.parse
@@ -23,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from mutagen.id3 import COMM, ID3, TCON, TXXX, ID3NoHeaderError
+from mutagen.id3 import COMM, ID3, TCON, TDRC, TPE2, TRCK, TXXX, ID3NoHeaderError
 from mutagen.mp3 import MP3
 
 from .genres import genre_is_invalid, is_junk, map_itunes_genre, split_genre
@@ -40,6 +41,10 @@ class FileState:
     title: str
     genres: list[str]
     comments: list[tuple[str, list[str]]]      # (frame key, texts)
+    track_artist: str = ""
+    albumartist: str = ""
+    track: str = ""
+    year: str = ""
 
 
 @dataclass
@@ -50,11 +55,13 @@ class Change:
     new_genre: list[str] | None = None
     genre_source: str = ""                      # itunes-track | library-artist | itunes-artist
     replaced: list[str] | None = None           # the valid genre this overrides, if any
+    fills: dict[str, str] = field(default_factory=dict)   # blank frames to add: TPE2 / TRCK / TDRC
+    fill_notes: list[str] = field(default_factory=list)   # why a gap was left alone
     notes: list[str] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
-        return not (self.remove_comment_keys or self.clear_genre or self.new_genre)
+        return not (self.remove_comment_keys or self.clear_genre or self.new_genre or self.fills)
 
 
 def read_state(path: Path) -> FileState | None:
@@ -73,7 +80,13 @@ def read_state(path: Path) -> FileState | None:
             artist = str(id3[fid].text[0])
             break
     title = str(id3["TIT2"].text[0]) if "TIT2" in id3 and id3["TIT2"].text else Path(path).stem
-    return FileState(Path(path), primary_artist(artist), title, genres, comments)
+    def text(fid: str) -> str:
+        return str(id3[fid].text[0]).strip() if fid in id3 and id3[fid].text else ""
+
+    year = text("TDRC") or text("TYER") or text("TDOR")
+    return FileState(Path(path), primary_artist(artist), title, genres, comments,
+                     track_artist=primary_artist(text("TPE1")), albumartist=text("TPE2"),
+                     track=text("TRCK"), year=year)
 
 
 def scan_folder(root: Path) -> tuple[list[FileState], list[Path]]:
@@ -105,6 +118,56 @@ def artist_majority_genres(states: list[FileState], min_files: int = 2, min_shar
     return out
 
 
+_TRACK_RE = re.compile(r"^\s*(\d{1,2})\s*[-._)\s]+(?=\D)")
+
+
+def _folder_majority(values: list[str], min_share: float, min_count: int) -> str | None:
+    counts = Counter(v for v in values if v)
+    if not counts:
+        return None
+    value, n = counts.most_common(1)[0]
+    total = sum(counts.values())
+    return value if n >= min_count and n / total >= min_share else None
+
+
+def plan_fills(states: list[FileState]) -> dict[Path, tuple[dict[str, str], list[str]]]:
+    """Blank album artist / track number / year, inferred only from the file's own folder and filename.
+
+    Never overwrites. Where the answer is not clear it adds nothing and says why.
+    """
+    by_folder: dict[Path, list[FileState]] = defaultdict(list)
+    for s in states:
+        by_folder[s.path.parent].append(s)
+    out: dict[Path, tuple[dict[str, str], list[str]]] = {}
+    for folder, group in by_folder.items():
+        album_artist = _folder_majority([s.albumartist for s in group], 0.5, 1)
+        artists = {norm(s.track_artist): s.track_artist for s in group if s.track_artist}
+        sole_artist = next(iter(artists.values())) if len(artists) == 1 else None
+        year = _folder_majority([s.year[:4] for s in group], 0.6, 2)
+        numbers = Counter(m.group(1).lstrip("0") or "0"
+                          for s in group for m in [_TRACK_RE.match(s.path.stem)] if m)
+        for s in group:
+            fills: dict[str, str] = {}
+            notes: list[str] = []
+            if not s.albumartist:
+                guess = album_artist or sole_artist
+                if guess:
+                    fills["TPE2"] = guess
+                else:
+                    notes.append(f"album artist unclear ({len(artists)} different artists in folder)")
+            if not s.track:
+                m = _TRACK_RE.match(s.path.stem)
+                if m and numbers[m.group(1).lstrip("0") or "0"] == 1:
+                    fills["TRCK"] = str(int(m.group(1)))
+                elif m:
+                    notes.append("track number in filename is not unique in the folder")
+            if not s.year and year:
+                fills["TDRC"] = year
+            if fills or notes:
+                out[s.path] = (fills, notes)
+    return out
+
+
 # Genres specific enough to justify overriding what a file already says. "Pop" is deliberately absent:
 # it is a catch-all, so it can fill a blank but never replaces a more specific existing genre.
 SPECIFIC = {"Hip Hop", "Punjabi Pop", "Sufi", "Devotional", "Ghazal", "Filmi", "Folk", "Classical", "R&B",
@@ -117,7 +180,7 @@ def _same(a: list[str], b: list[str]) -> bool:
 
 def plan_repair(states: list[FileState], artist_lookup: Lookup | None = None,
                 track_lookup: Callable[[str, str], "str | None"] | None = None,
-                use_library_majority: bool = True) -> list[Change]:
+                use_library_majority: bool = True, fill_gaps: bool = True) -> list[Change]:
     """Decide the tag changes. Genre, in order of trust:
 
       1. the track's own iTunes genre (exact title + artist). Fills blanks/junk, and may *override* a valid
@@ -127,6 +190,7 @@ def plan_repair(states: list[FileState], artist_lookup: Lookup | None = None,
     A valid existing genre is otherwise never touched.
     """
     majority = artist_majority_genres(states) if use_library_majority else {}
+    fill_plan = plan_fills(states) if fill_gaps else {}
     artist_cache: dict[str, str | None] = {}
     changes: list[Change] = []
     for s in states:
@@ -155,6 +219,8 @@ def plan_repair(states: list[FileState], artist_lookup: Lookup | None = None,
                     ch.new_genre, ch.genre_source = [artist_cache[akey]], "itunes-artist"
         if ch.new_genre:
             ch.clear_genre = False          # replaced, not merely cleared
+        if s.path in fill_plan:
+            ch.fills, ch.fill_notes = fill_plan[s.path]
         if not ch.empty:
             changes.append(ch)
     return changes
@@ -215,6 +281,10 @@ def apply_changes(changes: list[Change], journal: Journal, job_id: str | None = 
                     id3.delall("TCON")
                 if ch.new_genre:
                     id3.add(TCON(encoding=3, text=ch.new_genre))
+                snap["added"] = [k for k in ch.fills if k not in id3]   # only ever fill blanks
+                for fid in snap["added"]:
+                    frame = {"TPE2": TPE2, "TRCK": TRCK, "TDRC": TDRC}[fid]
+                    id3.add(frame(encoding=3, text=ch.fills[fid]))
 
             _swap_in(ch.path, edit)
             journal.finish(op_id, "done", tags_before=snap, fields_written=["comment", "genre"])
@@ -226,6 +296,8 @@ def apply_changes(changes: list[Change], journal: Journal, job_id: str | None = 
 def undo_retag(path: Path, snap: dict) -> None:
     """Put back exactly the genre and comment frames the repair removed or replaced."""
     def edit(id3: ID3) -> None:
+        for fid in snap.get("added", []):
+            id3.delall(fid)
         id3.delall("TCON")
         if snap.get("genre"):
             id3.add(TCON(encoding=3, text=snap["genre"]))
@@ -303,3 +375,45 @@ def itunes_artist_genre(artist: str, delay: float = 3.0) -> str | None:
         if n / total >= 0.5:
             return genre
     return None
+
+
+# -- junk stripping used while organising (so moved files arrive clean) --------------------------------
+def strip_junk_frames(path: Path) -> dict:
+    """Remove junk comments and a junk genre from an mp3, in place. Returns what was removed (for undo).
+
+    Meant for the temp copy made while moving a file; the original is never touched. Non-mp3 files are skipped.
+    """
+    path = Path(path)
+    if path.suffix.lower() != ".mp3":
+        return {}
+    state = read_state(path)
+    if state is None:
+        return {}
+    ch = Change(path, remove_comment_keys=[k for k, texts in state.comments if any(is_junk(t) for t in texts)],
+                clear_genre=bool(state.genres) and genre_is_invalid(state.genres))
+    if ch.empty:
+        return {}
+    id3 = ID3(path)
+    snap = _snapshot(id3, ch)
+    for key in ch.remove_comment_keys:
+        if key in id3:
+            del id3[key]
+    if ch.clear_genre:
+        id3.delall("TCON")
+    _save(id3, path)
+    return snap
+
+
+def restore_junk_frames(path: Path, snap: dict) -> None:
+    """Undo of strip_junk_frames: put the removed comment frames (and a cleared genre) back."""
+    def edit(id3: ID3) -> None:
+        if snap.get("genre"):
+            id3.delall("TCON")
+            id3.add(TCON(encoding=3, text=snap["genre"]))
+        for c in snap.get("comments", []):
+            if c["type"] == "COMM":
+                id3.add(COMM(encoding=3, lang=c["lang"], desc=c["desc"], text=c["text"]))
+            else:
+                id3.add(TXXX(encoding=3, desc=c["desc"], text=c["text"]))
+
+    _swap_in(Path(path), edit)

@@ -146,3 +146,54 @@ def test_override_is_undoable(make_mp3, tmp_path):
     undo_job(j, job)
     assert read_state(p).genres == ["Bhangra"]
     j.close()
+
+
+def numbered(make_mp3, folder, name, artist="Karan Aujla", albumartist=None, year=None):
+    from mutagen.id3 import TDRC as _TDRC, TPE1 as _TPE1
+    path = make_mp3(name, folder=folder)
+    id3 = ID3(path)
+    id3.add(_TPE1(encoding=3, text=artist))
+    if albumartist:
+        id3.add(TPE2(encoding=3, text=albumartist))
+    if year:
+        id3.add(_TDRC(encoding=3, text=year))
+    id3.save(path)
+    return path
+
+
+def test_blank_gaps_are_filled_from_folder_and_filename(make_mp3, tmp_path):
+    f = tmp_path / "lib" / "Album"
+    numbered(make_mp3, f, "01 Karan Aujla - Ashke.mp3", albumartist="Karan Aujla", year="2026-09-25")
+    numbered(make_mp3, f, "02 Karan Aujla & Ikka - Rap.mp3", albumartist="Karan Aujla", year="2026-09-25")
+    numbered(make_mp3, f, "03 Karan Aujla & Ikka - Blank.mp3", artist="Karan Aujla & Ikka")
+    states, _ = scan_folder(tmp_path / "lib")
+    ch = {c.path.name: c for c in plan_repair(states)}
+    c = ch["03 Karan Aujla & Ikka - Blank.mp3"]
+    assert c.fills == {"TPE2": "Karan Aujla", "TRCK": "3", "TDRC": "2026"}      # not "Karan Aujla & Ikka"
+
+
+def test_fills_never_overwrite_and_unclear_cases_add_nothing(make_mp3, tmp_path):
+    f = tmp_path / "lib" / "Mix"
+    numbered(make_mp3, f, "01 A - x.mp3", artist="A")
+    numbered(make_mp3, f, "01 B - y.mp3", artist="B")            # same number twice, two artists, no album artist
+    states, _ = scan_folder(tmp_path / "lib")
+    ch = {c.path.name: c for c in plan_repair(states)}
+    for c in ch.values():
+        assert "TPE2" not in c.fills and "TRCK" not in c.fills
+        assert any("unclear" in n for n in c.fill_notes) and any("not unique" in n for n in c.fill_notes)
+
+
+def test_fills_apply_and_undo_removes_only_what_was_added(make_mp3, tmp_path):
+    f = tmp_path / "lib" / "Album"
+    numbered(make_mp3, f, "01 Karan Aujla - Ashke.mp3", albumartist="Karan Aujla", year="2026")
+    numbered(make_mp3, f, "03 Karan Aujla - Other.mp3", albumartist="Karan Aujla", year="2026")
+    p = numbered(make_mp3, f, "02 Karan Aujla - Blank.mp3")
+    states, _ = scan_folder(tmp_path / "lib")
+    j = Journal(tmp_path / "s.db")
+    job = apply_changes(plan_repair(states), j)
+    after = read_state(p)
+    assert (after.albumartist, after.track, after.year) == ("Karan Aujla", "2", "2026")
+    undo_job(j, job)
+    back = read_state(p)
+    assert (back.albumartist, back.track, back.year) == ("", "", "")
+    j.close()
