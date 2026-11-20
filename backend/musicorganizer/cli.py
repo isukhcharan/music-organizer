@@ -221,6 +221,50 @@ def cmd_apply_reviewed(args, store: Store, journal: Journal) -> int:
     return 0 if not failed else 1
 
 
+def cmd_repair(args, store: Store, journal: Journal) -> int:
+    """Fix junk comments/genres in place on an existing library. Preview unless --yes."""
+    from .repair import TrackGenreLookup, apply_changes, itunes_artist_genre, plan_repair, scan_folder
+
+    root = Path(args.input).resolve()
+    if not root.is_dir():
+        print(f"Folder not found: {root}")
+        return 2
+    states, skipped = scan_folder(root)
+    print(f"{len(states)} mp3 files scanned; {len(skipped)} other/unreadable files left untouched.")
+    track = None if args.no_itunes else TrackGenreLookup(Path(args.db).with_name('itunes_genre_cache.json'))
+    # Artist-level fallbacks stamp one label on every track of an artist (a sad song gets "Bhangra"),
+    # so they are opt-in. By default only a track's own genre is used; otherwise the genre stays blank.
+    fallback = args.artist_fallback
+    changes = plan_repair(states, itunes_artist_genre if fallback and not args.no_itunes else None, track,
+                          use_library_majority=fallback)
+    overrides = [c for c in changes if c.replaced]
+    junk_c = sum(bool(c.remove_comment_keys) for c in changes)
+    cleared = sum(c.clear_genre for c in changes)
+    filled = Counter(c.genre_source for c in changes if c.new_genre)
+    print(f"{len(changes)} files would change: {junk_c} junk comments removed, {cleared} junk genres cleared, "
+          f"genre filled {dict(filled)}.")
+    print(f"{len(overrides)} existing genres would be OVERRIDDEN by a more specific per-track genre:")
+    for c in overrides[:12]:
+        print(f"    {c.path.name[:50]:<50} {' / '.join(c.replaced)} -> {' / '.join(c.new_genre)}")
+    by_genre = Counter(" / ".join(c.new_genre) for c in changes if c.new_genre)
+    print("Genres that would be written:", dict(by_genre.most_common(15)))
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["file", "remove_comments", "clear_genre", "new_genre", "genre_source", "replaces"])
+            for c in changes:
+                w.writerow([str(c.path), ";".join(c.remove_comment_keys), c.clear_genre,
+                            " / ".join(c.new_genre or []), c.genre_source, " / ".join(c.replaced or [])])
+        print(f"Per-file preview written to {args.csv}")
+    if not args.yes:
+        print("Preview only. Re-run with --yes to write (undo: `undo --job <id>`).")
+        return 0
+    job = apply_changes(changes, journal)
+    done = Counter(o["status"] for o in journal.operations(job))
+    print(f"Done: {dict(done)}. Undo with: python -m musicorganizer undo --job {job}")
+    return 0 if not done.get("failed") else 1
+
+
 def cmd_undo(args, store: Store, journal: Journal) -> int:
     job = store.get_job(args.job)
     result = undo_job(journal, args.job, Path(job["output_dir"]) if job else None)
@@ -273,6 +317,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job", required=True)
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_apply_reviewed)
+    p = sub.add_parser("repair", help="fix junk comments/genres in place (preview unless --yes)")
+    p.add_argument("--input", required=True)
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--no-itunes", action="store_true", help="do not query iTunes at all")
+    p.add_argument("--artist-fallback", action="store_true",
+                   help="also fill blank genres with the artist's usual genre (less accurate per track)")
+    p.add_argument("--csv", help="write the per-file preview here")
+    p.set_defaults(fn=cmd_repair)
     sub.add_parser("jobs", help="list jobs").set_defaults(fn=cmd_jobs)
     args = parser.parse_args(argv)
     store, journal = Store(args.db), Journal(args.db)

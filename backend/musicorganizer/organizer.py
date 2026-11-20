@@ -20,6 +20,7 @@ from pathlib import Path
 from mutagen import File as MutagenFile
 
 from .journal import Journal
+from .repair import undo_retag
 from .layout import destination_dir, destination_filename, infer_album_artists
 from .tags import AUDIO_EXTS, fill_blank_tags, read_local, restore_tags, snapshot_tags, write_tags
 from .text import primary_artist
@@ -193,6 +194,15 @@ def undo_job(journal: Journal, job_id: str, stop_at: Path | None = None) -> dict
     result = {"undone": 0, "skipped": []}
     for op in reversed(journal.operations(job_id)):
         if op["status"] != "done":
+            continue
+        if op["op_type"] == "retag":      # in-place tag repair: restore the removed/replaced frames
+            try:
+                undo_retag(Path(op["source"]), json.loads(op["tags_before"] or "{}"))
+                journal.finish(op["id"], "undone")
+                result["undone"] += 1
+            except Exception as exc:
+                journal.finish(op["id"], "undo_skipped", f"{type(exc).__name__}: {exc}")
+                result["skipped"].append((op["source"], f"{type(exc).__name__}: {exc}"))
             continue
         src, dest = Path(op["source"]), Path(op["dest"])
         if not dest.exists():
