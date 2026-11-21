@@ -287,8 +287,8 @@ def cmd_repair(args, store: Store, journal: Journal) -> int:
 def cmd_serve(args, store: Store, journal: Journal) -> int:
     from .api import serve
 
-    print(f"Music Organizer UI: http://127.0.0.1:{args.port}  (local only; Ctrl+C to stop)")
-    serve(args.db, args.port, open_browser=not args.no_browser)
+    print(f"Music Organizer UI listening on {args.host}:{args.port}  (Ctrl+C to stop)", flush=True)
+    serve(args.db, args.port, open_browser=not args.no_browser, host=args.host)
     return 0
 
 
@@ -389,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("serve", help="start the local web UI (binds to 127.0.0.1 only)")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--host", default="127.0.0.1", help="listen address (change only inside a container)")
     p.set_defaults(fn=cmd_serve)
     sub.add_parser("jobs", help="list jobs").set_defaults(fn=cmd_jobs)
     args = parser.parse_args(argv)

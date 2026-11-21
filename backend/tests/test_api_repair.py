@@ -29,7 +29,7 @@ def make_lib(make_mp3, tmp_path):
 def client(tmp_path):
     answers = {"a": "Hip-Hop/Rap", "c": "Punjabi Pop"}
     # same shape as TrackGenreLookup: (artist, title) -> mapped genre
-    lookup = lambda artist, title: {"a": "Hip Hop", "c": "Punjabi Pop"}.get(title)
+    lookup = lambda artist, title: {"a": "Hip Hop", "c": "Folk"}.get(title)
     return TestClient(create_app(tmp_path / "s.db", provider_factory=lambda n: None, genre_lookup=lookup))
 
 
@@ -50,7 +50,7 @@ def test_preview_apply_and_undo_through_the_api(client, make_mp3, tmp_path):
     s = wait_ready(client, rid)
     assert s["state"] == "ready" and s["progress"]["done"] == s["progress"]["total"] == 4
     assert s["summary"]["junk_comments"] == 2 and s["summary"]["junk_genres_cleared"] == 1
-    assert s["summary"]["genres_overridden"] == 1                              # c: Bhangra -> Punjabi Pop
+    assert s["summary"]["genres_overridden"] == 1                              # c: Bhangra -> Folk
     items = {i["path"]: i for i in client.get(f"/api/repair/{rid}/changes").json()["items"]}
     assert items["a.mp3"]["removed_comments"] == ["latest"] and items["a.mp3"]["new_genre"] == ["Hip Hop"]
     assert items["c.mp3"]["overrides"] and items["c.mp3"]["old_genre"] == ["Bhangra"]
@@ -64,7 +64,7 @@ def test_preview_apply_and_undo_through_the_api(client, make_mp3, tmp_path):
     assert r["results"] == {"done": 4}
     assert read_state(p["a"]).genres == ["Hip Hop"] and read_state(p["a"]).comments == []
     assert read_state(p["b"]).genres == [] and read_state(p["b"]).comments == []
-    assert read_state(p["c"]).genres == ["Punjabi Pop"]
+    assert read_state(p["c"]).genres == ["Folk"]
     assert read_state(p["d"]).comments == [("TXXX:comment", ["Live in Toronto"])] and read_state(p["d"]).albumartist == "Karan Aujla"
 
     assert client.post(f"/api/repair/{rid}/undo", json={"confirm": True}).json()["undone"] == 4

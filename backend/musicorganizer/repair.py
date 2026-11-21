@@ -168,9 +168,10 @@ def plan_fills(states: list[FileState]) -> dict[Path, tuple[dict[str, str], list
     return out
 
 
-# Genres specific enough to justify overriding what a file already says. "Pop" is deliberately absent:
-# it is a catch-all, so it can fill a blank but never replaces a more specific existing genre.
-SPECIFIC = {"Hip Hop", "Punjabi Pop", "Sufi", "Devotional", "Ghazal", "Filmi", "Folk", "Classical", "R&B",
+# Genres specific enough to justify overriding what a file already says. "Pop" and "Punjabi Pop" are deliberately
+# absent: iTunes files almost all Punjabi music under one catch-all ("Indian Pop" -> "Punjabi Pop"), so those
+# may fill a blank but never replace a more specific existing genre such as Hip Hop or Bhangra.
+SPECIFIC = {"Hip Hop", "Sufi", "Devotional", "Ghazal", "Filmi", "Folk", "Classical", "R&B",
             "Rock", "Electronic", "Dance", "Singer-Songwriter"}
 
 
@@ -184,7 +185,7 @@ def plan_repair(states: list[FileState], artist_lookup: Lookup | None = None,
     """Decide the tag changes. Genre, in order of trust:
 
       1. the track's own iTunes genre (exact title + artist). Fills blanks/junk, and may *override* a valid
-         existing genre when it is more specific (e.g. "Bhangra" -> "Hip Hop"/"Punjabi Pop"),
+         existing genre when it is more specific (e.g. "Bhangra" -> "Folk"/"Devotional"),
       2. blank/junk only: the artist's established genre from the library itself,
       3. blank/junk only: the artist's iTunes genre.
     A valid existing genre is otherwise never touched.

@@ -118,10 +118,12 @@ def test_track_genre_overrides_a_more_generic_existing_genre_but_pop_never_does(
     tag(make_mp3("sad.mp3", folder=lib), genre="Bhangra")
     tag(make_mp3("pop.mp3", folder=lib), genre="Bhangra")
     tag(make_mp3("same.mp3", folder=lib), genre="Hip Hop")
-    answers = {"sad": "Punjabi Pop", "pop": "Pop", "same": "Hip Hop"}
+    tag(make_mp3("catchall.mp3", folder=lib), genre="Hip Hop")
+    answers = {"sad": "Folk", "pop": "Pop", "same": "Hip Hop", "catchall": "Punjabi Pop"}
     states, _ = scan_folder(lib)
     ch = {c.path.stem: c for c in plan_repair(states, track_lookup=lambda a, t: answers[t])}
-    assert ch["sad"].new_genre == ["Punjabi Pop"] and ch["sad"].replaced == ["Bhangra"]
+    assert ch["sad"].new_genre == ["Folk"] and ch["sad"].replaced == ["Bhangra"]
+    assert "catchall" not in ch       # iTunes' catch-all "Punjabi Pop" must not replace a specific "Hip Hop"
     assert "pop" not in ch            # catch-all "Pop" must not replace "Bhangra"
     assert "same" not in ch           # nothing to change
 
@@ -141,8 +143,8 @@ def test_override_is_undoable(make_mp3, tmp_path):
     p = tag(make_mp3("sad.mp3", folder=lib, title="sad"), genre="Bhangra")
     states, _ = scan_folder(lib)
     j = Journal(tmp_path / "s.db")
-    job = apply_changes(plan_repair(states, track_lookup=lambda a, t: "Punjabi Pop"), j)
-    assert read_state(p).genres == ["Punjabi Pop"]
+    job = apply_changes(plan_repair(states, track_lookup=lambda a, t: "Folk"), j)
+    assert read_state(p).genres == ["Folk"]
     undo_job(j, job)
     assert read_state(p).genres == ["Bhangra"]
     j.close()

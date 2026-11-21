@@ -1,0 +1,30 @@
+# Music Organizer on a server. The published port is bound to loopback only; expose it privately with
+#   tailscale serve --bg --https=10000 http://127.0.0.1:8765
+# MO_ALLOWED_HOSTS must list the hostname you open it with. MO_ROOTS confines every folder the app can see.
+services:
+  organizer:
+    build: .
+    image: music-organizer:latest
+    container_name: organizer
+    restart: unless-stopped
+    user: "1001:1001"                       # same owner as the music files, so ownership never changes
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      MO_ALLOWED_HOSTS: "${MO_ALLOWED_HOSTS:?set MO_ALLOWED_HOSTS in .env}"
+      MO_ROOTS: "/music"
+    volumes:
+      - /srv/media/Music:/music             # the library (read-write; the app only touches folders you select)
+      - /srv/data/organizer:/data           # job state, undo journal, iTunes cache, trash
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/status', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

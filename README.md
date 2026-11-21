@@ -50,3 +50,18 @@ FastAPI backend and the React review UI (interactive review is not in the CLI ye
 ## Not in git
 
 `data/`, `reports/`, `Output/` and databases are ignored; they contain personal library metadata.
+
+## Run on a server (Docker + Tailscale)
+
+`Dockerfile` and `compose.yml` run the web UI in a container that sees only the music library (`MO_ROOTS=/music`),
+runs as the library's owner, has a read-only root filesystem and publishes its port on loopback only.
+
+```
+# on the server, in the project folder (with MO_ALLOWED_HOSTS=<your tailnet hostname> in .env)
+docker compose up -d --build
+tailscale serve --bg --https=10000 http://127.0.0.1:8765      # tailnet-only HTTPS, like any other service
+```
+
+Stop it with `docker compose down` and `tailscale serve --https=10000 off`. The UI has no login of its own: access
+control is Tailscale. Do not publish it to the internet. Job state, the undo journal and the iTunes cache live in
+the `/data` volume.

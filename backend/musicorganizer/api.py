@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import string
 import subprocess
 import sys
@@ -99,11 +100,12 @@ print(filedialog.askdirectory(initialdir=sys.argv[1] or None, mustexist=True, ti
 
 
 # -- helpers ----------------------------------------------------------------------------------------
-def _is_local(value: str | None) -> bool:
+def _is_local(value: str | None, allowed: set[str] | None = None) -> bool:
+    """True when a Host/Origin header names this machine (or a hostname explicitly allowed, e.g. a Tailscale name)."""
     if not value:
         return True
     host = urlparse(value if "//" in value else f"//{value}").hostname
-    return host in LOCAL_HOSTS
+    return (host or "").lower() in (allowed if allowed is not None else LOCAL_HOSTS)
 
 
 def _candidates(row: dict) -> list[dict]:
@@ -119,12 +121,32 @@ _DEFAULT = object()
 
 
 def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | None = None,
-               trash=_DEFAULT, genre_lookup=_DEFAULT) -> FastAPI:
+               trash=_DEFAULT, genre_lookup=_DEFAULT, allowed_hosts: set[str] | None = None,
+               roots: list[str] | None = None) -> FastAPI:
     """``provider_factory(name)`` returns a Provider; tests pass a fake, the real app builds YouTube Music etc.
-    ``trash(path)`` sends a folder to the Recycle Bin (default: send2trash, or None if it is not installed)."""
+    ``trash(path)`` sends a folder to the Recycle Bin (default: send2trash, or None if it is not installed).
+
+    Server deployments (e.g. a container behind Tailscale) configure two things, via arguments or environment:
+      * ``allowed_hosts`` / MO_ALLOWED_HOSTS: extra hostnames accepted in Host/Origin (comma separated),
+      * ``roots`` / MO_ROOTS: the only folders that may be browsed or used as input/output (comma separated).
+    """
     if provider_factory is None:
         from .cli import build_provider as provider_factory  # noqa: PLW0621
     trash_fn = default_trash() if trash is _DEFAULT else trash
+    env_hosts = {h.strip().lower() for h in os.environ.get("MO_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    allowed = LOCAL_HOSTS | env_hosts | {h.lower() for h in (allowed_hosts or set())}
+    raw_roots = roots if roots is not None else [r.strip() for r in os.environ.get("MO_ROOTS", "").split(",") if r.strip()]
+    root_paths = [Path(r).resolve() for r in raw_roots]
+
+    def in_roots(p: Path) -> bool:
+        if not root_paths:
+            return True
+        rp = p.resolve()
+        return any(rp == r or r in rp.parents for r in root_paths)
+
+    def require_in_roots(p: Path, what: str) -> None:
+        if not in_roots(p):
+            raise HTTPException(400, f"{what} must be inside the music folder ({', '.join(map(str, root_paths))})")
     repairs: dict[str, dict] = {}
 
     app = FastAPI(title="Music Organizer", docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -140,7 +162,7 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
-        if not _is_local(request.headers.get("host")) or not _is_local(request.headers.get("origin")):
+        if not _is_local(request.headers.get("host"), allowed) or not _is_local(request.headers.get("origin"), allowed):
             return JSONResponse({"detail": "local access only"}, status_code=403)
         return await call_next(request)
 
@@ -158,6 +180,11 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
     @app.get("/api/fs/list")
     def list_dirs(path: str = Query("")):
         """Directory browser for choosing input/output folders (directories only, no file names)."""
+        if not path and root_paths:
+            return {"path": "", "parent": None, "dirs": [{"name": str(r), "path": str(r)} for r in root_paths]}
+        if path and root_paths:
+            if not in_roots(Path(path)):
+                raise HTTPException(403, "outside the music folder")
         if not path:
             if sys.platform == "win32":
                 roots = [f"{d}:\\" for d in string.ascii_uppercase if Path(f"{d}:\\").exists()]
@@ -178,7 +205,9 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
         except OSError as exc:
             raise HTTPException(403, f"cannot read folder: {exc}")
         audio = sum(1 for c in p.iterdir() if c.is_file() and c.suffix.lower() in {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".wma", ".aac"}) if p.is_dir() else 0
-        return {"path": str(p), "parent": str(p.parent) if p.parent != p else "", "dirs": dirs, "audio_files_here": audio}
+        at_root = bool(root_paths) and p.resolve() in root_paths
+        parent = "" if (p.parent == p or at_root) else str(p.parent)
+        return {"path": str(p), "parent": parent, "dirs": dirs, "audio_files_here": audio}
 
     @app.post("/api/fs/pick")
     def pick_folder(body: PickBody):
@@ -188,6 +217,8 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
         dialog appears on the same screen as the browser. Returns 501 when tkinter is unavailable (some Linux
         installs), and the UI then falls back to its in-app folder browser.
         """
+        if root_paths:       # a server deployment: a dialog would open on the server's screen, so never do that
+            raise HTTPException(501, "native folder dialog is not available on a server")
         initial = body.initial if body.initial and Path(body.initial).is_dir() else ""
         try:
             done = subprocess.run(
@@ -228,6 +259,8 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
     @app.post("/api/jobs", status_code=201)
     def create_job(body: NewJob):
         inp, out = Path(body.input_dir), Path(body.output_dir)
+        require_in_roots(inp, "input folder")
+        require_in_roots(out, "output folder")
         if not inp.is_dir():
             raise HTTPException(400, f"input folder not found: {inp}")
         if not out.parent.exists():
@@ -285,7 +318,7 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
 
     @app.websocket("/api/jobs/{job_id}/ws")
     async def job_ws(ws: WebSocket, job_id: str):
-        if not _is_local(ws.headers.get("host")) or not _is_local(ws.headers.get("origin")):
+        if not _is_local(ws.headers.get("host"), allowed) or not _is_local(ws.headers.get("origin"), allowed):
             await ws.close(code=1008)
             return
         await ws.accept()
@@ -597,6 +630,7 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
     @app.post("/api/repair", status_code=201)
     def repair_start(body: RepairBody):
         folder = Path(body.folder)
+        require_in_roots(folder, "folder")
         if not folder.is_dir():
             raise HTTPException(400, f"folder not found: {folder}")
         rid = Journal.new_job_id()
@@ -658,8 +692,9 @@ def create_app(db_path: Path | str, provider_factory: Callable[[str], object] | 
     return app
 
 
-def serve(db_path: Path | str, port: int = 8765, open_browser: bool = True) -> None:
-    """Run the app on loopback only and open the browser."""
+def serve(db_path: Path | str, port: int = 8765, open_browser: bool = True, host: str = "127.0.0.1") -> None:
+    """Run the app (loopback by default) and open the browser. ``host`` is only changed inside a container,
+    where the published port is itself bound to loopback / a private network."""
     import uvicorn
 
     app = create_app(db_path)
@@ -672,4 +707,4 @@ def serve(db_path: Path | str, port: int = 8765, open_browser: bool = True) -> N
         import webbrowser
 
         threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
