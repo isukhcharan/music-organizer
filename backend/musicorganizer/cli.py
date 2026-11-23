@@ -284,6 +284,32 @@ def cmd_repair(args, store: Store, journal: Journal) -> int:
     return 0 if not done.get("failed") else 1
 
 
+def cmd_albumfix(args, store: Store, journal: Journal) -> int:
+    """Fix album artist / playlist-position track numbers in place. Preview unless --yes."""
+    from .albumfix import apply_albumfix, plan_albumfix, scan_folder
+
+    root = Path(args.input).resolve()
+    if not root.is_dir():
+        print(f"Folder not found: {root}")
+        return 2
+    states, skipped = scan_folder(root)
+    changes, notes = plan_albumfix(states)
+    print(f"{len(states)} files scanned ({len(skipped)} unreadable, left alone); {len(changes)} would change.")
+    for c in changes:
+        print(f"  {c.path.relative_to(root)}")
+        for r in c.reasons:
+            print(f"      {r}")
+    for n in notes:
+        print(f"  NOTE {n}")
+    if not args.yes:
+        print("Preview only. Re-run with --yes to write (undo: `undo --job <id>`).")
+        return 0
+    job = apply_albumfix(changes, journal)
+    done = Counter(o["status"] for o in journal.operations(job))
+    print(f"Done: {dict(done)}. Undo with: python -m musicorganizer undo --job {job}")
+    return 0 if not done.get("failed") else 1
+
+
 def cmd_serve(args, store: Store, journal: Journal) -> int:
     from .api import serve
 
@@ -381,6 +407,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="also fill blank genres with the artist's usual genre (less accurate per track)")
     p.add_argument("--csv", help="write the per-file preview here")
     p.set_defaults(fn=cmd_repair)
+    p = sub.add_parser("albumfix", help="make album artists consistent and drop playlist-position track numbers "
+                                        "in place (preview unless --yes)")
+    p.add_argument("--input", required=True)
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_albumfix)
     p = sub.add_parser("cleanup", help="remove empty/leftover-only folders from the input folder (preview unless --yes)")
     p.add_argument("--job", required=True)
     p.add_argument("--yes", action="store_true")

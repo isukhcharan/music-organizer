@@ -242,6 +242,16 @@ def undo_job(journal: Journal, job_id: str, stop_at: Path | None = None) -> dict
             journal.finish(op["id"], "undo_skipped", reason)
             result["skipped"].append((str(dest), reason))
             continue
+        if op["op_type"] == "albumfix":   # in-place album artist / track number fix: restore the old values
+            try:
+                from .albumfix import undo_albumfix
+                undo_albumfix(Path(op["source"]), json.loads(op["tags_before"] or "{}"))
+                journal.finish(op["id"], "undone")
+                result["undone"] += 1
+            except Exception as exc:
+                journal.finish(op["id"], "undo_skipped", f"{type(exc).__name__}: {exc}")
+                result["skipped"].append((op["source"], f"{type(exc).__name__}: {exc}"))
+            continue
         if op["op_type"] == "retag":      # in-place tag repair: restore the removed/replaced frames
             try:
                 undo_retag(Path(op["source"]), json.loads(op["tags_before"] or "{}"))
